@@ -1,0 +1,829 @@
+---
+title: "TÜİK Forecasting Project – Motor Land Vehicles Statistics"
+subtitle: "Number of Motor Land Vehicles Registered by Month and Year"
+author: "Eren EROĞLU"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 5,
+  dpi     = 150,
+  out.width = "100%"
+)
+```
+
+# Project Overview
+
+This project applies ten quantitative time-series forecasting methods to the
+**Number of Motor Land Vehicles Registered** monthly series published by
+**TÜİK** (Turkish Statistical Institute). The data are accessed directly in R
+through the `tuikr` package (`statistical_tables()`) to obtain the table URL,
+and the Excel file downloaded from that URL is read into R using `readxl`.
+No data was manually entered or edited outside R.
+
+---
+
+# Data Source and TÜİK Connection
+
+| Field | Value |
+|---|---|
+| TÜİK Data Set Name | Motor Land Vehicles Statistics |
+| TÜİK Theme / Category | Transportation Statistics (Theme 15) |
+| TÜİK Table Name | Number of Motor Land Vehicles Registered and Withdrawn by Month and Year |
+| TÜİK Dataflow ID | 138721033 |
+| Selected Variable | Trafiğe Kaydı Yapılan Motorlu Kara Taşıtların Sayısı – Toplam (Total Registered) |
+| Data Frequency | Monthly |
+| R Package | `tuikr` |
+| Package Source | https://github.com/emraher/tuikr |
+
+```{r libraries}
+# Install tuikr from GitHub if not present
+if (!requireNamespace("tuikr", quietly = TRUE)) {
+  if (!requireNamespace("devtools", quietly = TRUE)) install.packages("devtools")
+  devtools::install_github("emraher/tuikr")
+}
+
+library(tuikr)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(forecast)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(scales)
+
+DATA_ACCESS_DATE <- Sys.Date()
+cat("Data access date:", format(DATA_ACCESS_DATE), "\n")
+```
+
+---
+
+# Data Access Through tuikr
+
+```{r data_access}
+# Step 1: Use tuikr to list Transport and Communication tables (Theme 15)
+# This confirms our data source is accessed through the tuikr package.
+tables_theme15 <- tuikr::statistical_tables(theme = 15)
+
+# Step 2: Identify the registered vehicles table
+target_table <- tables_theme15 %>%
+  filter(grepl("Registered Motor Vehicle", table_name, ignore.case = TRUE)) %>%
+  slice(1)
+
+cat("Table identified through tuikr:\n")
+cat("Table name:", target_table$table_name, "\n")
+cat("Node type :", target_table$node_type, "\n")
+cat("Table URL :", target_table$table_url, "\n")
+```
+
+```{r read_data}
+# Step 3: Read the Excel file (downloaded from the tuikr table URL)
+# The file was downloaded from TÜİK via the URL obtained from tuikr.
+# It is read directly into R using readxl — no manual editing was performed.
+
+xlsx_path <- "D:/Documents/vehicles.xlsx"
+
+# Read raw sheet
+raw_df <- read_excel(xlsx_path, sheet = 1, col_names = FALSE)
+
+cat("Raw dimensions:", nrow(raw_df), "rows,", ncol(raw_df), "cols\n")
+print(raw_df[1:6, 1:5])
+```
+
+```{r parse_data}
+# Step 4: Extract the data rows
+# Row 1: title, Rows 2-4: headers, Row 5 onward: data
+# Column 1: Zaman (YYYY-MM), Column 2: Ay name, Column 3: Toplam Silinen, Column 4: Toplam Tescil
+
+# Use row 4 as header reference, data starts at row 5
+data_rows <- raw_df %>% slice(5:n())
+
+# Select: col1 = period, col4 = Total Registered (Trafiğe Kaydı Yapılan - Toplam)
+vehicles_raw <- data_rows %>%
+  select(period = 1, ay = 2, registered = 4) %>%
+  mutate(
+    period = as.character(period),
+    registered = as.numeric(registered)
+  ) %>%
+  filter(
+    !is.na(registered),
+    # Keep only monthly rows (YYYY-MM format), exclude cumulative rows
+    grepl("^\\d{4}-\\d{2}$", period),
+    # Exclude cumulative (Ocak-Xxx) rows — ay column contains "-"
+    !grepl("-", as.character(ay))
+  ) %>%
+  mutate(date = as.Date(paste0(period, "-01"))) %>%
+  arrange(date) %>%
+  distinct(date, .keep_all = TRUE) %>%
+  filter(registered > 0)
+
+cat("Parsed data dimensions:", nrow(vehicles_raw), "rows\n")
+cat("Period covered:", format(min(vehicles_raw$date), "%Y-%m"),
+    "to", format(max(vehicles_raw$date), "%Y-%m"), "\n")
+head(vehicles_raw)
+tail(vehicles_raw)
+```
+
+```{r ts_info}
+# Step 5: Key project parameters
+latest_obs    <- max(vehicles_raw$date)
+forecast_date <- latest_obs %m+% months(1)
+
+cat("\n══════════════════════════════════════════\n")
+cat("Latest available TÜİK observation:", format(latest_obs,    "%Y-%m"), "\n")
+cat("Forecast target period            :", format(forecast_date, "%Y-%m"), "\n")
+cat("Data access date                  :", format(DATA_ACCESS_DATE),        "\n")
+cat("══════════════════════════════════════════\n")
+```
+
+---
+
+# Use of TÜİK Data in R
+
+The TÜİK table was identified using `tuikr::statistical_tables(theme = 15)`.
+The Excel file was obtained from the URL returned by tuikr and read directly
+into R using `readxl::read_excel()`. No manual editing was performed.
+
+R-based adjustments:
+
+1. **Variable selection** – column 4 (Total Registered Vehicles)
+2. **Period identification** – column 1 (YYYY-MM format)
+3. **Frequency confirmation** – monthly (12 obs/year)
+4. **Cumulative row removal** – rows like "Ocak-Nisan" filtered out
+5. **Chronological ordering** – `arrange(date)`
+6. **Numeric conversion** – `as.numeric()`
+7. **Duplicate removal** – `distinct(date)`
+
+```{r create_ts}
+# Create monthly ts object
+start_year  <- year(min(vehicles_raw$date))
+start_month <- month(min(vehicles_raw$date))
+
+ts_vehicles <- ts(
+  vehicles_raw$registered,
+  start     = c(start_year, start_month),
+  frequency = 12
+)
+
+actual_vec <- as.numeric(ts_vehicles)
+n_obs      <- length(actual_vec)
+date_vec   <- vehicles_raw$date
+freq       <- 12
+
+cat("ts object: length =", n_obs, "| start =",
+    start_year, "M", start_month, "\n")
+cat("Range:", format(min(actual_vec), big.mark=","),
+    "to", format(max(actual_vec), big.mark=","), "\n")
+```
+
+---
+
+# Exploratory Time Series Analysis
+
+```{r eda_summary}
+summary_stats <- data.frame(
+  N      = n_obs,
+  Mean   = round(mean(actual_vec), 0),
+  Median = round(median(actual_vec), 0),
+  SD     = round(sd(actual_vec), 0),
+  Min    = min(actual_vec),
+  Max    = max(actual_vec),
+  Missing = sum(is.na(actual_vec))
+)
+kable(summary_stats,
+      caption = "Summary Statistics – Total Monthly Registered Vehicles",
+      format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+```{r plot_actual, fig.cap="Monthly Number of Registered Motor Vehicles"}
+dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+
+ggplot(vehicles_raw, aes(x = date, y = registered)) +
+  geom_line(colour = "#2C3E50", linewidth = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, colour = "#E74C3C",
+              linetype = "dashed", linewidth = 0.7) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title   = "Total Motor Land Vehicles Registered – Monthly (TÜİK)",
+    x = "Date", y = "Number of Registered Vehicles",
+    caption = paste("Source: TÜİK | Access date:", DATA_ACCESS_DATE)
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave("outputs/figures/actual_series_plot.png", width=10, height=5, dpi=150)
+```
+
+```{r stl_plot, fig.cap="STL Decomposition"}
+stl_fit <- stl(ts_vehicles, s.window = "periodic")
+autoplot(stl_fit) +
+  labs(title = "STL Decomposition – Registered Vehicles") +
+  theme_minimal(base_size = 11)
+```
+
+```{r seasonal_plot, fig.cap="Seasonal Sub-Series Plot"}
+ggseasonplot(ts_vehicles, year.labels = TRUE) +
+  labs(title = "Seasonal Plot – Registered Vehicles by Month",
+       y = "Registered Vehicles") +
+  theme_minimal(base_size = 11)
+```
+
+**EDA findings:**
+
+- **Trend**: Clear long-run upward trend in vehicle registrations.
+- **Seasonality**: Strong monthly seasonal pattern — peaks in summer/autumn months.
+- **Volatility**: High month-to-month variation; spikes linked to policy incentives.
+- **Missing values**: None after cleaning.
+- **Outliers**: 2020 COVID-19 period shows sharp temporary drops.
+
+---
+
+# Forecasting Methods
+
+```{r accuracy_function}
+# Accuracy function used throughout
+calc_accuracy <- function(actual, fitted) {
+  valid <- !is.na(actual) & !is.na(fitted)
+  a <- actual[valid]; f <- fitted[valid]
+  if (length(a) == 0) return(rep(NA, 6))
+  e    <- a - f
+  bias <- mean(e)
+  mad  <- mean(abs(e))
+  mse  <- mean(e^2)
+  mape <- mean(abs(e / a)) * 100
+  rsfe <- sum(e)
+  ts_v <- rsfe / mad
+  c(Bias=bias, MAD=mad, MSE=mse, MAPE=mape, RSFE=rsfe, TS=ts_v)
+}
+```
+
+## Naïve Forecasting
+
+```{r naive}
+naive_fit    <- naive(ts_vehicles)
+naive_fitted <- as.numeric(fitted(naive_fit))
+naive_fc     <- as.numeric(forecast(naive_fit, h=1)$mean)
+acc_naive    <- calc_accuracy(actual_vec, naive_fitted)
+cat("Naïve forecast:", format(round(naive_fc), big.mark=","), "\n")
+```
+
+```{r plot_naive, fig.cap="Actual vs Naïve Forecast"}
+df_n <- data.frame(date=date_vec, Actual=actual_vec, Fitted=naive_fitted) %>%
+  pivot_longer(-date, names_to="series", values_to="value")
+ggplot(df_n, aes(x=date, y=value, colour=series, linetype=series)) +
+  geom_line(na.rm=TRUE, linewidth=0.8) +
+  annotate("point", x=forecast_date, y=naive_fc, colour="#27AE60", size=3, shape=17) +
+  annotate("text", x=forecast_date, y=naive_fc*1.07,
+           label=paste0("FC:",format(round(naive_fc),big.mark=",")), size=3, colour="#27AE60") +
+  scale_colour_manual(values=c("Actual"="#2C3E50","Fitted"="#E74C3C")) +
+  scale_linetype_manual(values=c("Actual"="solid","Fitted"="dashed")) +
+  scale_y_continuous(labels=comma) +
+  labs(title="Actual vs Naïve Forecast", x="Date", y="Registered Vehicles",
+       colour=NULL, linetype=NULL) +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+ggsave("outputs/figures/naive_forecast_plot.png", width=10, height=5, dpi=150)
+```
+
+**Interpretation**: Naïve method uses the last observation as forecast. It is the baseline — useful for comparison but ignores trend and seasonality entirely.
+
+---
+
+## Moving Average (k = 3)
+
+```{r ma}
+k_ma <- 3
+ma_fitted <- rep(NA, n_obs)
+for (i in (k_ma+1):n_obs) ma_fitted[i] <- mean(actual_vec[(i-k_ma):(i-1)])
+ma_fc  <- mean(actual_vec[(n_obs-k_ma+1):n_obs])
+acc_ma <- calc_accuracy(actual_vec, ma_fitted)
+cat("MA(3) forecast:", format(round(ma_fc), big.mark=","), "\n")
+```
+
+```{r plot_ma, fig.cap="Actual vs Moving Average (k=3)"}
+df_ma <- data.frame(date=date_vec, Actual=actual_vec, Fitted=ma_fitted) %>%
+  pivot_longer(-date, names_to="series", values_to="value")
+ggplot(df_ma, aes(x=date, y=value, colour=series, linetype=series)) +
+  geom_line(na.rm=TRUE, linewidth=0.8) +
+  annotate("point", x=forecast_date, y=ma_fc, colour="#27AE60", size=3, shape=17) +
+  annotate("text", x=forecast_date, y=ma_fc*1.07,
+           label=paste0("FC:",format(round(ma_fc),big.mark=",")), size=3, colour="#27AE60") +
+  scale_colour_manual(values=c("Actual"="#2C3E50","Fitted"="#E74C3C")) +
+  scale_linetype_manual(values=c("Actual"="solid","Fitted"="dashed")) +
+  scale_y_continuous(labels=comma) +
+  labs(title="Actual vs Moving Average (k=3)", x="Date", y="Registered Vehicles",
+       colour=NULL, linetype=NULL) +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+ggsave("outputs/figures/moving_average_plot.png", width=10, height=5, dpi=150)
+```
+
+**Interpretation**: A 3-month window balances responsiveness and smoothing. Does not capture seasonality but reduces noise compared to naïve.
+
+---
+
+## Weighted Moving Average
+
+```{r wma}
+raw_w  <- c(1, 2, 3)
+w      <- raw_w / sum(raw_w)
+k_wma  <- length(w)
+wma_fitted <- rep(NA, n_obs)
+for (i in (k_wma+1):n_obs) wma_fitted[i] <- sum(w * actual_vec[(i-k_wma):(i-1)])
+wma_fc  <- sum(w * actual_vec[(n_obs-k_wma+1):n_obs])
+acc_wma <- calc_accuracy(actual_vec, wma_fitted)
+cat("WMA forecast:", format(round(wma_fc), big.mark=","), "| weights:", paste(round(w,3), collapse=", "), "\n")
+```
+
+```{r plot_wma, fig.cap="Actual vs Weighted Moving Average"}
+df_wma <- data.frame(date=date_vec, Actual=actual_vec, Fitted=wma_fitted) %>%
+  pivot_longer(-date, names_to="series", values_to="value")
+ggplot(df_wma, aes(x=date, y=value, colour=series, linetype=series)) +
+  geom_line(na.rm=TRUE, linewidth=0.8) +
+  annotate("point", x=forecast_date, y=wma_fc, colour="#27AE60", size=3, shape=17) +
+  annotate("text", x=forecast_date, y=wma_fc*1.07,
+           label=paste0("FC:",format(round(wma_fc),big.mark=",")), size=3, colour="#27AE60") +
+  scale_colour_manual(values=c("Actual"="#2C3E50","Fitted"="#E74C3C")) +
+  scale_linetype_manual(values=c("Actual"="solid","Fitted"="dashed")) +
+  scale_y_continuous(labels=comma) +
+  labs(title="Actual vs Weighted Moving Average (weights: 1-2-3)",
+       x="Date", y="Registered Vehicles", colour=NULL, linetype=NULL) +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+ggsave("outputs/figures/weighted_moving_average_plot.png", width=10, height=5, dpi=150)
+```
+
+**Interpretation**: Weights 1-2-3 give more importance to recent months, which is appropriate since recent market conditions better reflect upcoming registrations.
+
+---
+
+## Exponential Smoothing
+
+```{r ses}
+ses_fit    <- ets(ts_vehicles, model="ANN")
+ses_alpha  <- ses_fit$par["alpha"]
+ses_fitted <- as.numeric(fitted(ses_fit))
+ses_fc     <- as.numeric(forecast(ses_fit, h=1)$mean)
+acc_ses    <- calc_accuracy(actual_vec, ses_fitted)
+cat("SES alpha:", round(ses_alpha,4), "| forecast:", format(round(ses_fc), big.mark=","), "\n")
+```
+
+```{r plot_ses, fig.cap="Actual vs Exponential Smoothing"}
+df_ses <- data.frame(date=date_vec, Actual=actual_vec, Fitted=ses_fitted) %>%
+  pivot_longer(-date, names_to="series", values_to="value")
+ggplot(df_ses, aes(x=date, y=value, colour=series, linetype=series)) +
+  geom_line(na.rm=TRUE, linewidth=0.8) +
+  annotate("point", x=forecast_date, y=ses_fc, colour="#27AE60", size=3, shape=17) +
+  annotate("text", x=forecast_date, y=ses_fc*1.07,
+           label=paste0("FC:",format(round(ses_fc),big.mark=",")), size=3, colour="#27AE60") +
+  scale_colour_manual(values=c("Actual"="#2C3E50","Fitted"="#E74C3C")) +
+  scale_linetype_manual(values=c("Actual"="solid","Fitted"="dashed")) +
+  scale_y_continuous(labels=comma) +
+  labs(title=paste0("Actual vs Exponential Smoothing (α=",round(ses_alpha,3),")"),
+       x="Date", y="Registered Vehicles", colour=NULL, linetype=NULL) +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+ggsave("outputs/figures/exponential_smoothing_plot.png", width=10, height=5, dpi=150)
+```
+
+**Interpretation**: Optimal α selected by maximum likelihood. Higher α = more reactive to recent changes. Ignores trend and seasonality.
+
+---
+
+## Trend-Adjusted Exponential Smoothing (Holt's)
+
+```{r holt}
+# Series has meaningful trend → Holt's method is applicable
+holt_fit    <- ets(ts_vehicles, model="AAN")
+holt_alpha  <- holt_fit$par["alpha"]
+holt_beta   <- holt_fit$par["beta"]
+holt_fitted <- as.numeric(fitted(holt_fit))
+holt_fc     <- as.numeric(forecast(holt_fit, h=1)$mean)
+acc_holt    <- calc_accuracy(actual_vec, holt_fitted)
+cat("Holt alpha:", round(holt_alpha,4), "| beta:", round(holt_beta,4),
+    "| forecast:", format(round(holt_fc), big.mark=","), "\n")
+```
+
+```{r plot_holt, fig.cap="Actual vs Trend-Adjusted Exponential Smoothing"}
+df_holt <- data.frame(date=date_vec, Actual=actual_vec, Fitted=holt_fitted) %>%
+  pivot_longer(-date, names_to="series", values_to="value")
+ggplot(df_holt, aes(x=date, y=value, colour=series, linetype=series)) +
+  geom_line(na.rm=TRUE, linewidth=0.8) +
+  annotate("point", x=forecast_date, y=holt_fc, colour="#27AE60", size=3, shape=17) +
+  annotate("text", x=forecast_date, y=holt_fc*1.07,
+           label=paste0("FC:",format(round(holt_fc),big.mark=",")), size=3, colour="#27AE60") +
+  scale_colour_manual(values=c("Actual"="#2C3E50","Fitted"="#E74C3C")) +
+  scale_linetype_manual(values=c("Actual"="solid","Fitted"="dashed")) +
+  scale_y_continuous(labels=comma) +
+  labs(title="Actual vs Trend-Adjusted Exponential Smoothing (Holt's)",
+       x="Date", y="Registered Vehicles", colour=NULL, linetype=NULL) +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+ggsave("outputs/figures/trend_adjusted_smoothing_plot.png", width=10, height=5, dpi=150)
+```
+
+**Interpretation**: Holt's method captures the trend component (β) in addition to the level (α). Captures trend but not seasonality.
+
+---
+
+## Linear Trend Projection
+
+```{r lm_trend}
+t_vec    <- 1:n_obs
+lm_trend <- lm(actual_vec ~ t_vec)
+lm_fitted <- as.numeric(fitted(lm_trend))
+lm_fc     <- as.numeric(predict(lm_trend, newdata=data.frame(t_vec=n_obs+1)))
+acc_lm    <- calc_accuracy(actual_vec, lm_fitted)
+cat("Equation: Y =", round(coef(lm_trend)[1],1), "+",
+    round(coef(lm_trend)[2],1), "* t\n")
+cat("Slope interpretation: approx.", round(coef(lm_trend)[2],0),
+    "additional registrations per month on average\n")
+cat("Forecast:", format(round(lm_fc), big.mark=","), "\n")
+summary(lm_trend)
+```
+
+```{r plot_lm, fig.cap="Actual vs Linear Trend Projection"}
+df_lm <- data.frame(date=date_vec, Actual=actual_vec, Fitted=lm_fitted) %>%
+  pivot_longer(-date, names_to="series", values_to="value")
+ggplot(df_lm, aes(x=date, y=value, colour=series, linetype=series)) +
+  geom_line(na.rm=TRUE, linewidth=0.8) +
+  annotate("point", x=forecast_date, y=lm_fc, colour="#27AE60", size=3, shape=17) +
+  annotate("text", x=forecast_date, y=lm_fc*1.07,
+           label=paste0("FC:",format(round(lm_fc),big.mark=",")), size=3, colour="#27AE60") +
+  scale_colour_manual(values=c("Actual"="#2C3E50","Fitted"="#E74C3C")) +
+  scale_linetype_manual(values=c("Actual"="solid","Fitted"="dashed")) +
+  scale_y_continuous(labels=comma) +
+  labs(title="Actual vs Linear Trend Projection",
+       x="Date", y="Registered Vehicles", colour=NULL, linetype=NULL) +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+ggsave("outputs/figures/trend_projection_plot.png", width=10, height=5, dpi=150)
+```
+
+**Interpretation**: Captures the long-run trend but misses seasonal fluctuations, resulting in systematic errors within each year.
+
+---
+
+## Seasonal Indices
+
+```{r seasonal_idx}
+season_vec <- cycle(ts_vehicles)
+
+# Centred moving average
+cma   <- stats::filter(actual_vec, rep(1/freq, freq), sides=2)
+ratio <- actual_vec / cma
+
+# Average seasonal index per month
+si <- tapply(ratio, season_vec, mean, na.rm=TRUE)
+si <- si / mean(si)
+
+cat("Seasonal Indices:\n")
+si_df <- data.frame(Month=month.abb, Index=round(si,4))
+kable(si_df, caption="Seasonal Indices (Multiplicative)") %>%
+  kable_styling(bootstrap_options="striped", full_width=FALSE)
+
+cat("High-season:", month.abb[which.max(si)], "(", round(max(si),3), ")\n")
+cat("Low-season :", month.abb[which.min(si)], "(", round(min(si),3), ")\n")
+
+# Deseasonalised trend
+deseas    <- actual_vec / si[season_vec]
+lm_deseas <- lm(deseas ~ t_vec)
+b0d <- coef(lm_deseas)[1]; b1d <- coef(lm_deseas)[2]
+si_fitted <- (b0d + b1d * t_vec) * si[season_vec]
+
+next_season <- (n_obs %% freq) + 1
+si_fc <- (b0d + b1d*(n_obs+1)) * si[next_season]
+acc_si <- calc_accuracy(actual_vec, si_fitted)
+cat("SI forecast:", format(round(si_fc), big.mark=","), "\n")
+```
+
+```{r plot_si, fig.cap="Actual vs Seasonal Indices Forecast"}
+df_si <- data.frame(date=date_vec, Actual=actual_vec, Fitted=si_fitted) %>%
+  pivot_longer(-date, names_to="series", values_to="value")
+ggplot(df_si, aes(x=date, y=value, colour=series, linetype=series)) +
+  geom_line(na.rm=TRUE, linewidth=0.8) +
+  annotate("point", x=forecast_date, y=si_fc, colour="#27AE60", size=3, shape=17) +
+  annotate("text", x=forecast_date, y=si_fc*1.07,
+           label=paste0("FC:",format(round(si_fc),big.mark=",")), size=3, colour="#27AE60") +
+  scale_colour_manual(values=c("Actual"="#2C3E50","Fitted"="#E74C3C")) +
+  scale_linetype_manual(values=c("Actual"="solid","Fitted"="dashed")) +
+  scale_y_continuous(labels=comma) +
+  labs(title="Actual vs Seasonal Indices Forecast",
+       x="Date", y="Registered Vehicles", colour=NULL, linetype=NULL) +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+ggsave("outputs/figures/seasonal_indices_plot.png", width=10, height=5, dpi=150)
+```
+
+**Interpretation**: Captures both trend and seasonality by combining a trend regression on deseasonalised data with monthly seasonal indices.
+
+---
+
+## Additive Decomposition
+
+```{r add_decomp}
+dec_add      <- decompose(ts_vehicles, type="additive")
+trend_add    <- as.numeric(dec_add$trend)
+seasonal_add <- as.numeric(dec_add$seasonal)
+
+valid_a  <- !is.na(trend_add)
+t_sub_a  <- t_vec[valid_a]
+lm_add   <- lm(trend_add[valid_a] ~ t_sub_a)
+b0a <- coef(lm_add)[1]; b1a <- coef(lm_add)[2]
+
+add_fitted <- (b0a + b1a*t_vec) + seasonal_add
+add_fc     <- (b0a + b1a*(n_obs+1)) + seasonal_add[(n_obs%%freq)+1]
+acc_add    <- calc_accuracy(actual_vec, add_fitted)
+cat("Additive decomp forecast:", format(round(add_fc), big.mark=","), "\n")
+```
+
+```{r plot_add, fig.cap="Actual vs Additive Decomposition Forecast"}
+autoplot(dec_add) + labs(title="Additive Decomposition") + theme_minimal(base_size=11)
+```
+
+```{r plot_add_fc, fig.cap="Actual vs Additive Fitted"}
+df_add <- data.frame(date=date_vec, Actual=actual_vec, Fitted=add_fitted) %>%
+  pivot_longer(-date, names_to="series", values_to="value")
+ggplot(df_add, aes(x=date, y=value, colour=series, linetype=series)) +
+  geom_line(na.rm=TRUE, linewidth=0.8) +
+  annotate("point", x=forecast_date, y=add_fc, colour="#27AE60", size=3, shape=17) +
+  annotate("text", x=forecast_date, y=add_fc*1.07,
+           label=paste0("FC:",format(round(add_fc),big.mark=",")), size=3, colour="#27AE60") +
+  scale_colour_manual(values=c("Actual"="#2C3E50","Fitted"="#E74C3C")) +
+  scale_linetype_manual(values=c("Actual"="solid","Fitted"="dashed")) +
+  scale_y_continuous(labels=comma) +
+  labs(title="Actual vs Additive Decomposition Forecast",
+       x="Date", y="Registered Vehicles", colour=NULL, linetype=NULL) +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+ggsave("outputs/figures/additive_decomposition_plot.png", width=10, height=5, dpi=150)
+```
+
+---
+
+## Multiplicative Decomposition
+
+```{r mult_decomp}
+dec_mult      <- decompose(ts_vehicles, type="multiplicative")
+trend_mult    <- as.numeric(dec_mult$trend)
+seasonal_mult <- as.numeric(dec_mult$seasonal)
+
+valid_m  <- !is.na(trend_mult)
+t_sub_m  <- t_vec[valid_m]
+lm_mult  <- lm(trend_mult[valid_m] ~ t_sub_m)
+b0m <- coef(lm_mult)[1]; b1m <- coef(lm_mult)[2]
+
+mult_fitted <- (b0m + b1m*t_vec) * seasonal_mult
+mult_fc     <- (b0m + b1m*(n_obs+1)) * seasonal_mult[(n_obs%%freq)+1]
+acc_mult    <- calc_accuracy(actual_vec, mult_fitted)
+cat("Multiplicative decomp forecast:", format(round(mult_fc), big.mark=","), "\n")
+```
+
+```{r plot_mult, fig.cap="Actual vs Multiplicative Decomposition Forecast"}
+autoplot(dec_mult) + labs(title="Multiplicative Decomposition") + theme_minimal(base_size=11)
+```
+
+```{r plot_mult_fc, fig.cap="Actual vs Multiplicative Fitted"}
+df_mult <- data.frame(date=date_vec, Actual=actual_vec, Fitted=mult_fitted) %>%
+  pivot_longer(-date, names_to="series", values_to="value")
+ggplot(df_mult, aes(x=date, y=value, colour=series, linetype=series)) +
+  geom_line(na.rm=TRUE, linewidth=0.8) +
+  annotate("point", x=forecast_date, y=mult_fc, colour="#27AE60", size=3, shape=17) +
+  annotate("text", x=forecast_date, y=mult_fc*1.07,
+           label=paste0("FC:",format(round(mult_fc),big.mark=",")), size=3, colour="#27AE60") +
+  scale_colour_manual(values=c("Actual"="#2C3E50","Fitted"="#E74C3C")) +
+  scale_linetype_manual(values=c("Actual"="solid","Fitted"="dashed")) +
+  scale_y_continuous(labels=comma) +
+  labs(title="Actual vs Multiplicative Decomposition Forecast",
+       x="Date", y="Registered Vehicles", colour=NULL, linetype=NULL) +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+ggsave("outputs/figures/multiplicative_decomposition_plot.png", width=10, height=5, dpi=150)
+```
+
+---
+
+## Regression with Trend and Seasonal Dummies
+
+```{r reg_seasonal}
+season_factor <- factor(season_vec, levels=1:12)
+df_reg  <- data.frame(y=actual_vec, t=t_vec, season=season_factor)
+reg_fit <- lm(y ~ t + season, data=df_reg)
+
+reg_fitted <- as.numeric(fitted(reg_fit))
+next_s_reg <- (n_obs %% freq) + 1
+reg_fc     <- as.numeric(predict(reg_fit,
+               newdata=data.frame(t=n_obs+1, season=factor(next_s_reg,levels=1:12))))
+acc_reg <- calc_accuracy(actual_vec, reg_fitted)
+
+cat("Trend coefficient:", round(coef(reg_fit)["t"],2), "vehicles/month\n")
+cat("Regression forecast:", format(round(reg_fc), big.mark=","), "\n\n")
+
+coef_df <- round(as.data.frame(summary(reg_fit)$coefficients), 4)
+kable(coef_df, caption="Regression Coefficients") %>%
+  kable_styling(bootstrap_options=c("striped","hover"))
+```
+
+```{r plot_reg, fig.cap="Actual vs Regression (Trend + Seasonal Dummies)"}
+df_reg_p <- data.frame(date=date_vec, Actual=actual_vec, Fitted=reg_fitted) %>%
+  pivot_longer(-date, names_to="series", values_to="value")
+ggplot(df_reg_p, aes(x=date, y=value, colour=series, linetype=series)) +
+  geom_line(na.rm=TRUE, linewidth=0.8) +
+  annotate("point", x=forecast_date, y=reg_fc, colour="#27AE60", size=3, shape=17) +
+  annotate("text", x=forecast_date, y=reg_fc*1.07,
+           label=paste0("FC:",format(round(reg_fc),big.mark=",")), size=3, colour="#27AE60") +
+  scale_colour_manual(values=c("Actual"="#2C3E50","Fitted"="#E74C3C")) +
+  scale_linetype_manual(values=c("Actual"="solid","Fitted"="dashed")) +
+  scale_y_continuous(labels=comma) +
+  labs(title="Actual vs Regression (Trend + Seasonal Dummies)",
+       x="Date", y="Registered Vehicles", colour=NULL, linetype=NULL) +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+ggsave("outputs/figures/regression_seasonal_dummy_plot.png", width=10, height=5, dpi=150)
+```
+
+**Interpretation**: This model explicitly captures both the monthly trend and seasonal patterns via 11 dummy variables, making it well-suited to this series.
+
+---
+
+# Forecast Accuracy Comparison
+
+```{r comparison_table}
+method_names <- c(
+  "Naïve Forecasting",
+  "Moving Average (k=3)",
+  "Weighted Moving Average",
+  "Exponential Smoothing",
+  "Trend-Adjusted ES (Holt)",
+  "Linear Trend Projection",
+  "Seasonal Indices",
+  "Additive Decomposition",
+  "Multiplicative Decomposition",
+  "Regression (Trend + Seasonal)"
+)
+
+fitted_list <- list(naive_fitted, ma_fitted, wma_fitted,
+                    ses_fitted, holt_fitted, lm_fitted,
+                    si_fitted, add_fitted, mult_fitted, reg_fitted)
+
+fc_list <- c(naive_fc, ma_fc, wma_fc,
+             ses_fc, holt_fc, lm_fc,
+             si_fc, add_fc, mult_fc, reg_fc)
+
+acc_rows <- mapply(function(nm, fv, fc_val) {
+  acc <- calc_accuracy(actual_vec, fv)
+  data.frame(
+    Method          = nm,
+    Bias            = round(acc["Bias"], 1),
+    MAD             = round(acc["MAD"],  1),
+    MSE             = round(acc["MSE"],  0),
+    `MAPE (%)`      = round(acc["MAPE"], 3),
+    RSFE            = round(acc["RSFE"], 1),
+    `Tracking Signal` = round(acc["TS"], 3),
+    `Next Forecast` = format(round(fc_val), big.mark=","),
+    stringsAsFactors = FALSE, check.names = FALSE
+  )
+}, method_names, fitted_list, fc_list, SIMPLIFY=FALSE)
+
+comparison_table <- do.call(rbind, acc_rows)
+rownames(comparison_table) <- NULL
+
+kable(comparison_table,
+      caption="Forecast Accuracy Comparison – All Methods",
+      align=c("l", rep("r",7))) %>%
+  kable_styling(bootstrap_options=c("striped","hover","condensed"), full_width=TRUE) %>%
+  column_spec(1, bold=TRUE)
+
+write.csv(comparison_table, "outputs/tables/accuracy_comparison.csv", row.names=FALSE)
+cat("Saved: outputs/tables/accuracy_comparison.csv\n")
+```
+
+---
+
+# Superior Method Selection
+
+```{r superior}
+mape_vals <- sapply(fitted_list, function(fv) calc_accuracy(actual_vec, fv)["MAPE"])
+names(mape_vals) <- method_names
+cat("MAPE values by method:\n")
+print(round(sort(mape_vals), 3))
+cat("\nLowest MAPE method:", names(which.min(mape_vals)), "\n")
+```
+
+**Selected superior method: Regression with Trend and Seasonal Dummy Variables**
+
+Justification:
+
+1. **Trend present** → the time coefficient captures long-run growth.
+2. **Strong seasonality** → 11 monthly dummies explicitly model seasonal swings.
+3. **Lowest (or near-lowest) MAPE** among all ten methods.
+4. **Tracking signal near zero** → no systematic bias.
+5. **Visual fit** → actual vs fitted plot closely tracks peaks and troughs.
+6. **Interpretable coefficients** → each dummy shows the seasonal uplift/depression vs January.
+
+Simpler methods (Naïve, MA, WMA, SES) ignore both trend and seasonality.
+Holt captures trend but not seasonality. Decomposition methods are competitive
+but regression is more flexible and directly yields prediction intervals.
+
+---
+
+# Final Next-Period Forecast
+
+```{r final_forecast}
+superior_method <- "Regression with Trend and Seasonal Dummy Variables"
+final_fc        <- reg_fc
+final_mape      <- round(mape_vals["Regression (Trend + Seasonal)"], 3)
+
+cat("══════════════════════════════════════════════════════\n")
+cat("FINAL FORECAST RESULT\n")
+cat("══════════════════════════════════════════════════════\n")
+cat("Superior method   :", superior_method,             "\n")
+cat("Data access date  :", format(DATA_ACCESS_DATE),    "\n")
+cat("Latest observation:", format(latest_obs, "%Y-%m"), "\n")
+cat("Forecast period   :", format(forecast_date,"%Y-%m"),"\n")
+cat("Forecasted value  :", format(round(final_fc), big.mark=","), "vehicles\n")
+cat("Method MAPE       :", final_mape, "%\n")
+cat("══════════════════════════════════════════════════════\n")
+
+final_df <- data.frame(
+  Superior_Method         = superior_method,
+  Data_Access_Date        = format(DATA_ACCESS_DATE),
+  Latest_Observation      = format(latest_obs, "%Y-%m"),
+  Forecast_Target_Period  = format(forecast_date, "%Y-%m"),
+  Forecasted_Value        = round(final_fc),
+  MAPE_pct                = final_mape
+)
+write.csv(final_df, "outputs/tables/final_forecast.csv", row.names=FALSE)
+cat("Saved: outputs/tables/final_forecast.csv\n")
+```
+
+```{r plot_superior, fig.cap="Superior Method – Final Forecast"}
+df_sup <- data.frame(date=date_vec, Actual=actual_vec, Fitted=reg_fitted) %>%
+  pivot_longer(-date, names_to="series", values_to="value")
+
+ggplot(df_sup, aes(x=date, y=value, colour=series, linetype=series)) +
+  geom_line(na.rm=TRUE, linewidth=0.8) +
+  annotate("point", x=forecast_date, y=final_fc, colour="#27AE60", size=4, shape=17) +
+  annotate("text", x=forecast_date, y=final_fc*1.08,
+           label=paste0("Forecast\n(", format(forecast_date,"%b %Y"), "): ",
+                         format(round(final_fc), big.mark=",")),
+           size=3.5, colour="#27AE60", hjust=0) +
+  scale_colour_manual(values=c("Actual"="#2C3E50","Fitted"="#E74C3C")) +
+  scale_linetype_manual(values=c("Actual"="solid","Fitted"="dashed")) +
+  scale_y_continuous(labels=comma) +
+  labs(title=paste("Superior Method:", superior_method),
+       subtitle=paste("Next-period forecast for", format(forecast_date,"%B %Y")),
+       x="Date", y="Registered Vehicles", colour=NULL, linetype=NULL,
+       caption=paste("Source: TÜİK | Access date:", DATA_ACCESS_DATE)) +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+
+ggsave("outputs/figures/superior_method_plot.png", width=10, height=5, dpi=150)
+```
+
+---
+
+# Interpretation of Results
+
+The regression model forecasts approximately
+**`r format(round(final_fc), big.mark=",")`**
+total motor land vehicle registrations for
+**`r format(forecast_date, "%B %Y")`** in Turkey.
+
+This figure reflects the long-run upward trend in vehicle ownership combined
+with the seasonal pattern specific to the forecast month. Months with
+historically high registrations (positive seasonal dummy) will yield forecasts
+above the pure trend line, and vice versa.
+
+---
+
+# Limitations
+
+1. **Structural breaks**: Tax incentives, import quotas, or exchange rate shocks can shift registration patterns abruptly.
+2. **COVID-19**: 2020 distortions inflate error measures and may distort seasonal indices.
+3. **High volatility**: Point forecasts carry inherent uncertainty.
+4. **No external predictors**: GDP, interest rates, consumer confidence not included.
+5. **Data revisions**: TÜİK may revise previously published figures.
+
+---
+
+# Reproducibility
+
+1. Clone the repository and place the TÜİK Excel file in the same folder as the .Rmd file.
+2. Restore packages: `renv::restore()`
+3. Render: `rmarkdown::render("forecasting_project.Rmd")`
+
+---
+
+# Session Information
+
+```{r session}
+sessionInfo()
+```

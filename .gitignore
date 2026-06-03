@@ -1,0 +1,21 @@
+# R specific
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# renv cache (keep renv.lock but ignore library)
+renv/library/
+renv/staging/
+renv/.cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*~
+
+# IDE
+.idea/
